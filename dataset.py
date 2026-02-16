@@ -3,134 +3,93 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import matplotlib.pyplot as plt
+import glob
 
 class ChestXrayDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, image_size=64):
+    def __init__(self, root_dir, split='train', transform=None, image_size=128):
         """
         Args:
             root_dir: Path to chest_xray folder
             split: 'train', 'val', or 'test'
             transform: Optional transform to apply
-            image_size: Size to resize images to
         """
         self.root_dir = root_dir
-        self.split = split
-        self.image_size = image_size
-        
-        # Default transform if none provided
-        if transform is None:
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.Grayscale(num_output_channels=1),
-                transforms.ToTensor(),
-                # Normalize to [0, 1] (ToTensor already does this)
-            ])
-        else:
-            self.transform = transform
-        
-        # Collect all image paths
-        self.image_paths = []
+        self.transform = transform
+        self.data = [] # Will store tuples: (image_path, label)
 
-        # Try both uppercase and lowercase split names
-        split_options = [split.upper(), split.lower(), split.capitalize()]
+        # 1. Find the correct split folder (handle case sensitivity)
         split_dir = None
-
-        for split_name in split_options:
-            temp_dir = os.path.join(root_dir, split_name)
-            if os.path.exists(temp_dir):
-                split_dir = temp_dir
+        for s in [split, split.upper(), split.lower(), split.capitalize()]:
+            temp_path = os.path.join(root_dir, s)
+            if os.path.exists(temp_path):
+                split_dir = temp_path
                 break
-
+        
         if split_dir is None:
-            raise ValueError(f"Could not find split '{split}' in {root_dir}. Available: {os.listdir(root_dir)}")
+            raise ValueError(f"Could not find split '{split}' in {root_dir}")
 
-        # Get both NORMAL and PNEUMONIA folders
-        for category in ['NORMAL', 'PNEUMONIA']:
-            category_dir = os.path.join(split_dir, category)
-            if os.path.exists(category_dir):
-                for img_name in os.listdir(category_dir):
-                    if img_name.endswith(('.jpeg', '.jpg', '.png')):
-                        self.image_paths.append(os.path.join(category_dir, img_name))
+        # 2. Load Images and Assign Labels
+        # 0 = NORMAL, 1 = PNEUMONIA
+        categories = {'NORMAL': 0, 'PNEUMONIA': 1}
+        
+        for category, label in categories.items():
+            cat_dir = os.path.join(split_dir, category)
+            if os.path.exists(cat_dir):
+                # Recursively find all images
+                image_files = []
+                for ext in ['*.jpeg', '*.jpg', '*.png', '*.JPG']:
+                    image_files.extend(glob.glob(os.path.join(cat_dir, ext)))
+                
+                for img_path in image_files:
+                    self.data.append((img_path, label))
 
-        print(f"Found {len(self.image_paths)} images in {split} set")
+        print(f"Found {len(self.data)} images in {split} set")
     
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.data)
     
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('L')  # Convert to grayscale
+        img_path, label = self.data[idx]
         
+        # Open as Grayscale (1 channel)
+        try:
+            image = Image.open(img_path).convert('L')
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            # Return a blank black image if file is corrupt
+            image = Image.new('L', (128, 128))
+
         if self.transform:
             image = self.transform(image)
+        else:
+            # Default transform if none provided
+            default_trans = transforms.Compose([
+                transforms.Resize((128, 128)),
+                transforms.ToTensor(),
+                # Note: No normalization needed if using Sigmoid in VAE
+            ])
+            image = default_trans(image)
         
-        return image
+        return image, label
 
-def get_dataloaders(data_root, batch_size=32, image_size=64, num_workers=4):
+def get_dataloaders(data_root, batch_size=32, image_size=128, num_workers=2):
     """
     Create train, validation, and test dataloaders
     """
-    train_dataset = ChestXrayDataset(
-        root_dir=data_root,
-        split='train',
-        image_size=image_size
-    )
+    # Transform: Resize -> Tensor
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.Grayscale(num_output_channels=1),
+        transforms.ToTensor(),
+    ])
     
-    val_dataset = ChestXrayDataset(
-        root_dir=data_root,
-        split='val',
-        image_size=image_size
-    )
+    # We use 'test' set for validation because the official 'val' set is too small (16 images)
+    train_dataset = ChestXrayDataset(data_root, split='train', transform=transform)
+    val_dataset = ChestXrayDataset(data_root, split='test', transform=transform) 
+    test_dataset = ChestXrayDataset(data_root, split='test', transform=transform)
     
-    test_dataset = ChestXrayDataset(
-        root_dir=data_root,
-        split='test',
-        image_size=image_size
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
     
     return train_loader, val_loader, test_loader
-
-def visualize_samples(dataloader, num_samples=8):
-    """
-    Visualize some samples from the dataloader
-    """
-    images = next(iter(dataloader))
-    
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
-    axes = axes.flatten()
-    
-    for i in range(min(num_samples, len(images))):
-        img = images[i].squeeze().numpy()
-        axes[i].imshow(img, cmap='gray')
-        axes[i].axis('off')
-        axes[i].set_title(f'Sample {i+1}')
-    
-    plt.tight_layout()
-    plt.savefig('outputs/dataset_samples.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    print("Saved sample images to outputs/dataset_samples.png")
